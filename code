@@ -1,0 +1,119 @@
+## watermarktable  control table  in Azure Sql......................
+
+CREATE TABLE dbo.watermark_control (
+    source_name VARCHAR(100) PRIMARY KEY,
+    last_watermark DATETIME2(7),
+    last_run_utc DATETIME2(7),
+    last_row_count INT
+);
+Initialize watermark:
+INSERT INTO dbo.watermark_control (source_name, last_watermark, last_run_utc, last_row_count)
+VALUES ('user_details', '1970-01-01 00:00:00', GETUTCDATE(), 0);
+
+## lookup activity in ADF Lookup watermark
+SELECT last_watermark
+FROM dbo.watermark_control
+WHERE source_name = 'user_details';
+####lookup activity run
+@activity('Lookup_Watermark').output.firstRow.last_watermark
+
+  @concat('https://api.acharyaprashant.app/posts?since=', 
+        encodeURIComponent(coalesce(activity('Lookup_Watermark').output.firstRow.last_watermark, '1970-01-01T00:00:00Z')))
+
+
+  ## Databricks notebook: process_and_merge.py
+import json
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import *
+from pyspark.sql.types import *
+from delta.tables import DeltaTable
+
+# widgets (Databricks)
+dbutils.widgets.text("landing_path","")
+dbutils.widgets.text("last_watermark","1970-01-01T00:00:00Z")
+dbutils.widgets.text("bronze_path","/lakehouse/bronze/posts")
+
+landing_path = dbutils.widgets.get("landing_path")
+last_watermark = dbutils.widgets.get("last_watermark")
+bronze_path = dbutils.widgets.get("bronze_path")
+
+spark = SparkSession.builder.getOrCreate()
+
+# 1) Read JSON from landing
+#    If there are multiple files, Spark will read them all
+staging = spark.read.option("multiLine", False).json(landing_path)
+  
+if "last_modified" not in staging.columns:
+    raise Exception("staging data missing 'last_modified' field")# 
+staging = staging.withColumn("last_modified", col("last_modified").cast(TimestampType()))
+
+# 2) Filter records strictly greater than last_watermark (defensive)
+from pyspark.sql.functions import to_timestamp, lit
+# cast last_watermark to timestamp literal
+staging_filtered = staging.filter(col("last_modified") > to_timestamp(lit(last_watermark)))
+
+# 3) Deduplicate within batch: keep latest last_modified per id
+from pyspark.sql.window import Window
+from pyspark.sql.functions import row_number
+w = Window.partitionBy("id").orderBy(col("last_modified").desc())
+staging_dedup = staging_filtered.withColumn("rn", row_number().over(w)).filter(col("rn") == 1).drop("rn")
+
+# If no rows, return early
+row_count = staging_dedup.count()
+if row_count == 0:
+    result = {"row_count": 0, "max_last_modified": None}
+    dbutils.notebook.exit(json.dumps(result))
+
+# 4) MERGE into Delta bronze table (idempotent: update only if src.newer)
+if not DeltaTable.isDeltaTable(spark, bronze_path):
+    # initial create
+    staging_dedup.write.format("delta").mode("overwrite").save(bronze_path)
+else:
+    deltaTable = DeltaTable.forPath(spark, bronze_path)
+    deltaTable.alias("tgt").merge(
+        staging_dedup.alias("src"),
+        "tgt.id = src.id"
+    ).whenMatchedUpdate(condition="src.last_modified > tgt.last_modified",
+                        set={
+                            "title":"src.title",
+                            "content":"src.content",
+                            "last_modified":"src.last_modified",
+                            "author":"src.author",
+                            "source_raw":"src"    # optional store raw JSON
+                        }).whenNotMatchedInsertAll().execute()
+
+# 5) Compute max_last_modified of this run
+max_lm = staging_dedup.agg(spark_max("last_modified")).collect()[0][0]
+# format as ISO string (UTC)
+max_lm_iso = None
+if max_lm is not None:
+    max_lm_iso = max_lm.isoformat()
+
+# 6) Return results for ADF (via notebook output)
+result = {"row_count": row_count, "max_last_modified": max_lm_iso}
+dbutils.notebook.exit(json.dumps(result))
+
+Stored proocedure activity.......to update the last CDC
+  
+CREATE PROCEDURE dbo.update_watermark_acharya
+  @source_name VARCHAR(100),
+  @new_watermark DATETIME2(7),
+  @row_count INT
+AS
+BEGIN
+  IF @new_watermark IS NOT NULL
+  BEGIN
+    UPDATE dbo.watermark_control
+    SET last_watermark = @new_watermark,
+        last_run_utc = SYSUTCDATETIME(),
+        last_row_count = @row_count
+    WHERE source_name = @source_name;
+  END
+END
+
+
+
+
+
+
+  
